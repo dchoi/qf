@@ -1,0 +1,595 @@
+	! Notice
+	! This program was prepared by the University of California (University)
+	! under Contract W-7405-ENG-36 with the U.S. Department of Energy (DOE).
+	! All rights in the program are reserved by DOE on behalf of the Government
+	! and the University pursuant to the contract. You are authorized to use
+	! this program for Government purposes but it is not to be released or
+	! distributed to the public.
+	! NEITHER THE UNITED STATES NOR THE UNITED STATES DEPARTMENT OF ENERGY,
+	! NOR THE UNIVERSITY OF CALIFORNIA, NOR ANY OF THEIR EMPLOYEES,
+	! MAKES ANY WARRANTY, EXPRESS OR IMPLIED, OR ASSUMES ANY LEGAL LIABILITY
+	! OR RESPONSIBILITY FOR THE ACCURACY, COMPLETENESS, OR USEFULNESS, OF
+	! ANY INFORMATION, APPARATUS, PRODUCT, OR PROCESS DISCLOSED, OR REPRESENTS
+	! THAT ITS USE WOULD NOT INFRINGE PRIVATELY OWNED RIGHTS.
+	!
+	module sor3d_interface_module
+	!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+	! SOR3D is a 3 dimensional successive overrelaxation method solver.
+	! err is an absolute error measurement
+	! iter is the number of iterations spent in the solver
+	! p1 & p2 are Lagrange multipliers
+	! omegarelax is overelaxation coefficient specified in main.f
+	! ERP
+	! inlcudes PKKs f90 modifications 10/01/2002
+	! includes twh's deallocation procedure 1/8 and 1/9 2003
+	!ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+
+	implicit none
+	
+	contains
+	!======================================================================================
+	!======================================================================================
+	SUBROUTINE sor3d_flat()
+	
+	use time_module
+	use sor_module
+	use grid_module
+	use flags_module
+	use topo_module
+	
+	implicit none
+	
+	integer :: iter,i,j,k
+	real :: abse, eps
+				
+	iter = 0
+	abse = 0
+	
+	call InitP1(NO)
+	
+	do iter = 1,sor%itermax		
+		abse=0.0
+		
+		sor%p2 = sor%p1		
+		
+		!$omp parallel do private(i,j)
+		do k=2,qugrid%nz-2
+			do j=2,qugrid%ny-2
+				do i=2,qugrid%nx-2
+					sor%p1(i,j,k)=sor%denom(i,j,k)*									&
+						((sor%bc%e(i,j,k)*sor%p1(i+1,j,k)+							&
+						sor%bc%f(i,j,k)*sor%p1(i-1,j,k))+							&
+						(sor%bc%g(i,j,k)*sor%p1(i,j+1,k)+							&
+						sor%bc%h(i,j,k)*sor%p1(i,j-1,k))+							&
+						(sor%bc%m(i,j,k)*sor%p1(i,j,k+1)+							&
+						sor%bc%n(i,j,k)*sor%p1(i,j,k-1)) &
+						-sor%r(i,j,k)) + sor%one_minus_omegarelax*sor%p1(i,j,k)
+				enddo
+			enddo
+		enddo
+		!$OMP end parallel do
+								
+		! implementing the 'k' boundary condition, AAG & IS 07/03/06
+		! dlambda / dz	= 0 at the interface
+		sor%p1(:,:,1) = sor%p1(:,:,2)
+		! calculating residual, AAG 07/03/06
+		abse=sum(abs(sor%p1-sor%p2))*qugrid%one_over_nxnynz
+
+		! MAN 09/26/2006 added residual reduction check instead of max error
+		if(iter .eq. 1)then
+			eps = abse*sor%res_red_factor
+		endif
+
+		! checking convergence, AAG 07/03/06
+		if (abse < eps .or. abse .le. 1.e-9 .or. iter .eq. sor%itermax) exit
+		
+	enddo
+	! MAN 06/04/2007 keeps the correct number of iterations for cases where iter equals itermax
+	!print*, '# Iterations = ',iter, ';   Average Residual = ',abse
+	
+	sor%p2 = sor%p1
+	
+	end SUBROUTINE sor3d_flat
+	!======================================================================================
+	!======================================================================================
+	SUBROUTINE sor3d_flat_fire()
+	
+	use time_module
+	use sor_module
+	use grid_module
+	use flags_module
+	use topo_module
+	use performance_module
+        use mpi_setup
+	
+	implicit none
+
+        interface
+        subroutine sor3d_flat_fire_comp(is,ie,js,je,k,klocal,step, &
+        orelax, dim1, dim2, dim3, tnz, &
+        ve,vf,vg,vh,vm,vn,va2s,va2f,vr,vd,vp1,t_p1) bind(C, name="sor3d_flat_fire_comp")
+        use iso_c_binding
+        integer(c_int), value:: k,is,ie,js,je,step,klocal,dim1,dim2,dim3,tnz
+        real(c_float), value:: orelax, va2s
+        real(c_float),dimension(dim1,dim2,dim3-1) :: ve,vf,vg,vh,vm,vn,vr,vd
+        real(c_float),dimension(dim1,dim2,dim3)::va2f,vp1
+        real(c_float),dimension(dim1,dim2,tnz) :: t_p1
+            !integer(c_int), value :: n
+            !real(c_double), dimension(*) :: a, b, c
+        end subroutine sor3d_flat_fire_comp 
+        end interface
+	
+	integer :: iter,i,j,k,is,ie,js,je,ks,ke,step
+	real :: abse, prev_abse, prev_threshold	
+        real,dimension(:,:,:),allocatable :: t_p1
+        integer :: is0, ie0, js0, je0, ijsize, mp_s, mp_e, mp_w, klocal,k_a,k_b,dim1,dim2,dim3,tnz
+        integer :: dima1,dima2,dima3
+        integer :: dimb1,dimb2,dimb3
+
+	
+	iter = 0
+	abse = 0	
+	
+	call InitP1(NO)	
+
+	call SetBufferIndices(perf,is,ie,js,je,ks,ke)
+        
+        is0=is
+        ie0=ie
+        js0=js
+        je0=je
+		
+	!Shift in indices so swapping order every iteration lines up correctly
+	is=is+1
+	ie=ie-2
+	js=js+1
+	je=je-2
+	step=1
+
+                k_a=2
+                k_b=ke-2
+
+        call mpDomainSplit(k_a,k_b,mp_s,mp_e,mp_w)
+        dim1=size(sor%p1,1)
+        dim2=size(sor%p1,2)
+        dim3=size(sor%p1,3)
+        ijsize=dim1*dim2*(mp_e-mp_s+1)
+        !write(6,*)" mp",mprank,dim1,dim2,mp_s,mp_e,ijsize
+        call flush(6)
+        allocate (t_p1(dim1,dim2,mp_e-mp_s+1))
+        call copyA(t_p1,sor%p1,dim1,dim2,mp_s,mp_e)
+ 		
+	do iter = 1,sor%itermax
+		sor%p2 = sor%p1
+		! Swap index order
+		call SwapIndices(is,ie,js,je,step)
+        
+                klocal=1
+		do k=mp_s,mp_e
+                        tnz=mp_e-mp_s+1
+                        call sor3d_flat_fire_comp(is,ie,js,je,k,klocal,step, & 
+                                sor%one_minus_omegarelax, dim1, dim2, dim3, tnz, &
+                                sor%bc%e, sor%bc%f, sor%bc%g, sor%bc%h, &
+                                sor%bc%m, sor%bc%n, sor%alpha2sq, sor%alpha2_fire, &
+                                sor%r, sor%denom, sor%p1, t_p1)
+                        klocal=klocal+1
+		enddo
+        call flush(6)
+          call MPI_allgather(t_p1,ijsize,MPI_REAL,sor%p1(1,1,k_a),ijsize,MPI_REAL,MPI_COMM_WORLD, ierr)
+          !write(6,*)' gather done',mprank
+
+		
+		! implementing the 'k' boundary condition, AAG & IS 07/03/06
+		sor%p1(:,:,1) = sor%p1(:,:,2)		
+	
+		! calculating residual
+		abse=sum(abs(sor%p1-sor%p2))*qugrid%one_over_nxnynz
+					
+		! MAN 09/26/2006 added residual reduction check instead of max error
+		if(iter == 1)then
+			call DetermineThresholdIncreaseSorError(abse, prev_threshold)
+		else
+			! Withe the "keep p1" option, somethimes p1 goes to Inf. 
+			! Hence, abse > 1000. is a way to fix that before it gets out of control
+			if((abse > prev_abse .and. prev_abse > prev_threshold) .or. abse > 1000.) then
+				if(flag%isfire == YES) then
+					print*, "Smoothing alpha 2 for stability constraints"
+					sor%p1 = 0.
+					sor%p2 = 0.					
+					call SmoothAlpha2()
+					call RecomputeDenom()
+				else
+					print*, 'SOR is diverging.'
+					call TerminateProgram()
+				endif
+			endif
+		endif
+		prev_abse = abse
+		! checking convergence, AAG 07/03/06
+		!print*, '# Iterations = ',iter, ';   Average Residual = ',abse
+		
+		if (abse < abse*sor%res_red_factor .or. abse .le. 1.e-9 .or. iter .eq. sor%itermax) exit		
+
+	enddo
+	sor%p2 = sor%p1
+	
+	end SUBROUTINE sor3d_flat_fire
+	!======================================================================================
+	!======================================================================================
+	SUBROUTINE sor3d_terrain()
+
+	use time_module
+	use sor_module
+	use grid_module
+	use winds_module
+	use flags_module
+	use topo_module
+	use performance_module
+        use mpi_setup
+	
+	implicit none
+	
+	integer :: iter, i, j, k, count,		&
+				is,ie,js,je,ks,ke,step		
+				
+	real :: abse, dlong, T1m, ovdx2, ovdy2, prev_abse, prev_threshold, initial_error	
+        real,dimension(:,:,:),allocatable :: t_p1
+        integer :: is0, ie0, js0, je0, ijsize, mp_s, mp_e, mp_w, klocal,k_a,k_b,dim1,dim2,dim3
+	
+	call SetBufferIndices(perf,is,ie,js,je,ks,ke)
+
+	iter = 0
+	abse = 0.
+	ovdx2 = 1. / qugrid%dx**2
+	ovdy2 = 1. / qugrid%dy**2
+
+        is0=is
+        ie0=ie
+        js0=js
+        je0=je
+
+	!Shift in is so swapping order every iteration lines up correctly
+	is=is+1
+	js=js+1
+	step=1
+
+	call InitP1(NO)
+
+	iter = 0
+	count = 0
+
+        !k_a=3
+        k_a=2
+        k_b=ke-1
+
+        call mpDomainSplit(k_a,k_b,mp_s,mp_e,mp_w)
+        dim1=size(sor%p1,1)
+        dim2=size(sor%p1,2)
+        dim3=size(sor%p1,3)
+        ijsize=dim1*dim2*(mp_e-mp_s+1)
+        allocate (t_p1(dim1,dim2,mp_e-mp_s+1))
+        write(6,*)" mp",mprank,dim1,dim2,mp_s,mp_e,ijsize
+        call copyA(t_p1,sor%p1,dim1,dim2,mp_s,mp_e)
+
+	do while(iter < sor%itermax)
+		iter = iter + 1
+                write(6,*) "Iteration: ",iter
+		
+		sor%p2 = sor%p1  !Holds previous state
+      sor%p3 = sor%p1  !Working array for inbetween steps
+      
+		! Swap index order
+		call SwapIndices(is,ie,js,je,step)
+		! Iterate over ground layer (above the ground)
+      k = 2
+		!!$OMP parallel do private(i, j, Hh2, T1m, dlong)
+      do j = js,je,step
+         do i = is,ie,step
+            T1m = (sor%alpha1 / sor%alpha2_fire(i-1,j-1,k))**2 * sor%Hh2(i, j) / (qugrid%sigma(k)-qugrid%sigma(k-1))				
+
+				! Cross-derivatives d/dx,d/dz
+            sor%p1(i,j,k)= -sor%r(i-1,j-1,k-1)                                         										&
+					+ ovdx2*(sor%p1(i+1,j,k)+sor%p1(i-1,j,k))                                   									&
+					+ ovdy2*(sor%p1(i,j+1,k)+sor%p1(i,j-1,k))                                   									&
+					+ (sor%bc%T3(i-1,j-1,k-1)+sor%bc%T1(i-1,j-1,k-1)+T1m)*sor%p1(i,j,k+1)/qugrid%dsigmam(k)         		&
+					+ (sor%bc%T3(i-1,j-1,k-1)-sor%bc%T1(i-1,j-1,k-1)-T1m)                                         			&
+					* ((0.25*topo%dhdx(i,j)*qugrid%dxi*(sor%p1(i+1,j,k)-sor%p1(i-1,j,k)                     					&
+					+     sor%p1(i+1,j,k-1)-sor%p1(i-1,j,k-1)))                                             					&
+					+ (0.25*topo%dhdy(i,j)*qugrid%dyi*(sor%p1(i,j+1,k)-sor%p1(i,j-1,k)                      					&
+					+     sor%p1(i,j+1,k-1)-sor%p1(i,j-1,k-1))))                                              				&
+					+ 2.0*sor%bc%T2x(i-1,j-1,k-1)/(qugrid%sigma(k)-qugrid%sigma(k-1))*                              		&
+					(((qugrid%sigmam(k+1)-qugrid%sigma(k))*(sor%p1(i+1,j,k+1)-sor%p1(i-1,j,k+1))             					&
+					+(qugrid%sigma(k)-qugrid%sigmam(k))*(sor%p1(i+1,j,k)-sor%p1(i-1,j,k)))/qugrid%dsigmam(k) 					&   
+					-((qugrid%sigmam(k)-qugrid%sigma(k-1))*(sor%p1(i+1,j,k)-sor%p1(i-1,j,k))             						&
+					+(qugrid%sigma(k-1)-qugrid%sigmam(k-1))*(sor%p1(i+1,j,k-1)-sor%p1(i-1,j,k-1)))/qugrid%dsigmam(k-1)) 	&   
+					+ 2.0*sor%bc%T2y(i-1,j-1,k-1)/(qugrid%sigma(k)-qugrid%sigma(k-1))*                                		&
+					(((qugrid%sigmam(k+1)-qugrid%sigma(k))*(sor%p1(i,j+1,k+1)-sor%p1(i,j-1,k+1))             					&
+					+(qugrid%sigma(k)-qugrid%sigmam(k))*(sor%p1(i,j+1,k)-sor%p1(i,j-1,k)))/qugrid%dsigmam(k) 					&
+					-((qugrid%sigmam(k)-qugrid%sigma(k-1))*(sor%p1(i,j+1,k)-sor%p1(i,j-1,k))             						&
+					+(qugrid%sigma(k-1)-qugrid%sigmam(k-1))*(sor%p1(i,j+1,k-1)-sor%p1(i,j-1,k-1)))/qugrid%dsigmam(k-1))
+            
+					dlong = 2.0*(ovdx2+ovdy2)+(sor%bc%T3(i-1,j-1,k-1)+sor%bc%T1(i-1,j-1,k-1)+T1m)/qugrid%dsigmam(k) 
+
+					sor%p1(i,j,k) = sor%omegarelax*(sor%p1(i,j,k)/dlong) + sor%one_minus_omegarelax*sor%p2(i,j,k)
+         enddo
+      enddo
+		!!$OMP end parallel do
+		sor%p3(:,:,2)=sor%p1(:,:,2)
+		
+		!Upper Layers
+      klocal=1
+      do k = mp_s,mp_e
+         !$OMP parallel do private(i,j,T1m,dlong,t_p1,klocal)
+         do j = js,je,step
+            do i = is,ie,step
+					T1m = sor%alpha1**2/sor%alpha2_fire(i-1,j-1,k)**2 * sor%Hh2(i,j)/(qugrid%sigma(k)-qugrid%sigma(k-1))
+               
+               t_p1(i,j,klocal) = &
+						-sor%r(i-1,j-1,k-1)+(sor%p1(i+1,j,k)+sor%p1(i-1,j,k))*ovdx2+(sor%p1(i,j+1,k)+sor%p1(i,j-1,k))*ovdy2 	&
+						+(sor%bc%T3(i-1,j-1,k-1)+sor%bc%T1(i-1,j-1,k-1)+T1m)/(qugrid%dsigmam(k))*sor%p1(i,j,k+1) 					&
+						-(sor%bc%T3(i-1,j-1,k-1)-(sor%bc%T1(i-1,j-1,k-1)+T1m))/(qugrid%dsigmam(k-1))*sor%p1(i,j,k-1) 			&
+						+sor%bc%T2x(i-1,j-1,k-1) 																										&
+						*(((sor%p1(i+1,j,k+1)-sor%p1(i+1,j,k))/qugrid%dsigmam(k) 															&
+						+(sor%p1(i+1,j,k)-sor%p1(i+1,j,k-1))/qugrid%dsigmam(k-1) 															&
+						-(sor%p1(i-1,j,k+1)-sor%p1(i-1,j,k))/qugrid%dsigmam(k)   															&
+						-(sor%p1(i-1,j,k)-sor%p1(i-1,j,k-1))/qugrid%dsigmam(k-1))) 															&
+						+sor%bc%T2y(i-1,j-1,k-1) 																										&
+						*(((sor%p1(i,j+1,k+1)-sor%p1(i,j+1,k))/qugrid%dsigmam(k) 															&
+						+(sor%p1(i,j+1,k)-sor%p1(i,j+1,k-1))/qugrid%dsigmam(k-1) 															&
+						-(sor%p1(i,j-1,k+1)-sor%p1(i,j-1,k))/qugrid%dsigmam(k)   															&
+						-(sor%p1(i,j-1,k)-sor%p1(i,j-1,k-1))/qugrid%dsigmam(k-1))) 
+
+               dlong = (2.0*ovdx2+2.0*ovdy2												 					&
+						+(sor%bc%T3(i-1,j-1,k-1)+sor%bc%T1(i-1,j-1,k-1)+T1m)/(qugrid%dsigmam(k)) 	&
+						-(sor%bc%T3(i-1,j-1,k-1)-(sor%bc%T1(i-1,j-1,k-1)+T1m))/(qugrid%dsigmam(k-1)))
+
+               !Divide Denominator (LHS)
+               t_p1(i,j,klocal) = t_p1(i,j,klocal)/dlong
+
+               !SOR weighting
+               t_p1(i,j,klocal) = sor%omegarelax*t_p1(i,j,klocal) + sor%one_minus_omegarelax*sor%p2(i,j,k)
+            enddo
+         enddo
+         !$OMP end parallel do 
+         klocal=klocal+1
+      enddo
+      !write(6,*)' gather start',mprank
+      call MPI_allgather(t_p1,ijsize,MPI_REAL,sor%p1(1,1,k_a),ijsize,MPI_REAL,MPI_COMM_WORLD, ierr)
+      !write(6,*)' gather done',mprank
+      !call MPI_Barrier(MPI_COMM_WORLD, ierr)
+      !write(6,*)" ms:",mp_s
+
+		sor%p3 = sor%p1
+
+      k = 2
+		sor%p1(:,:,k-1) = sor%p1(:,:,k)
+      !Bottom BC
+      !$OMP parallel do private(i,j)
+      do j = js,je,step
+         do i = is,ie,step
+				
+				sor%p1(i,j,k-1)=sor%p1(i,j,k)-(qugrid%dsigmam(k-1)*(0.25*topo%dhdx(i,j) 						&
+					*(sor%p1(i+1,j,k-1)-sor%p1(i-1,j,k-1)+sor%p1(i+1,j,k)-sor%p1(i-1,j,k))/qugrid%dx 		&
+					+0.25*topo%dhdy(i,j) 																						&
+					*(sor%p1(i,j+1,k-1)-sor%p1(i,j-1,k-1)+sor%p1(i,j+1,k)-sor%p1(i,j-1,k))/qugrid%dy))     &
+					/((topo%dhdx(i,j)**2+topo%dhdy(i,j)**2+(sor%alpha1/sor%alpha2_fire(i-1,j-1,k-1))**2) 	&
+					*(qugrid%Lz/(qugrid%Lz-topo%h(i,j))))
+         enddo
+      enddo
+      !$OMP end parallel do
+		sor%p3(:,:,1)=sor%p1(:,:,1)
+				
+		! calculating residual, AAG 07/03/06
+		abse = sum(abs(sor%p1-sor%p2)) * qugrid%one_over_nxnynz
+
+		! MAN 09/26/2006 added residual reduction check instead of max error
+		if(iter == 1)then
+			initial_error = abse
+			call DetermineThresholdIncreaseSorError(abse, prev_threshold)			
+		else
+			if((abse > prev_abse .and. prev_abse > prev_threshold) .or. abse > 1000.) then
+				if(flag%isfire == YES) then
+					print*, 'SOR will be restarted'
+					if(fcatime%current_int > 0) then
+						print*, 'SOR will be restarted'
+						sor%p1 = 0.
+						sor%p2 = 0.
+					
+						if(count < 3)then
+							call SmoothAlpha2()
+							count = count + 1
+						else
+							! It's not going to converge with this alpha value
+							count = 0
+							sor%alpha2_fire = sor%alpha2
+						endif
+					else
+						if(sor%omegarelax > 0.5) then
+							sor%omegarelax = sor%omegarelax - 0.1
+							sor%one_minus_omegarelax = (1. - sor%omegarelax)
+							sor%invomegarelax = 1./sor%omegarelax
+						else
+							print*, 'SOR is diverging. Consider smoothing the terrain'
+							call TerminateProgram()
+						endif
+					endif
+					if(sor%itermax < 50) then
+						iter = min(iter, floor(real(sor%itermax)*2./3.))
+					endif
+					print*, 'Restarting iteration ', iter, 'abse', abse
+				else
+					print*, 'SOR is diverging. Consider smoothing the terrain'
+					call TerminateProgram()
+				endif
+			endif
+			
+		endif
+		! print*,'Iteration #', iter, ', Error: ', abse
+				
+		prev_abse = abse
+		! checking convergence, AAG 07/03/06
+		if (abse < abse*sor%res_red_factor .or. abse .le. 1.e-9 .or. iter .eq. sor%itermax) exit
+
+	enddo	
+
+	! print*, '# Iterations = ', iter, ';   Average Residual = ', abse
+	if(initial_error > abse) then
+		! SOR has successfully reduced the error
+		sor%p2 = sor%p1
+	else
+		! SOR has worse results than the initial field
+		sor%p2 = 0.
+	endif
+	
+	end SUBROUTINE sor3d_terrain
+	!======================================================================================
+	!======================================================================================
+	
+end module sor3d_interface_module
+	
+!===========================================================================================	
+!===========================================================================================
+	SUBROUTINE InitP1(force_reset)
+	
+	use sor_module
+	use grid_module
+	use flags_module
+
+	implicit none
+	
+	integer, intent(IN) :: force_reset
+	
+	if(sor%option == SOR_RESET_EACH_CYCLE .or. force_reset == YES)then
+		sor%p1 = 0.
+	endif
+	
+	END
+!===========================================================================================	
+!===========================================================================================
+	SUBROUTINE InitLagrangeMult()
+
+	use sor_module
+	use grid_module
+	use topo_module
+	use flags_module
+
+	implicit none
+
+	integer :: i, j
+	
+	allocate(sor%r(qugrid%nx-1,qugrid%ny-1,qugrid%nz-1))
+	if(topo%flag == NO) then
+		allocate(																	&
+			sor%p1(qugrid%nx-1,qugrid%ny-1,qugrid%nz),					&
+			sor%p2(qugrid%nx-1,qugrid%ny-1,qugrid%nz))
+	else
+		allocate(																	&
+			sor%p1(qugrid%nx+1,qugrid%ny+1,qugrid%nz),					&
+			sor%p2(qugrid%nx+1,qugrid%ny+1,qugrid%nz),					&
+			sor%p3(qugrid%nx+1,qugrid%ny+1,qugrid%nz),					&
+			sor%Hh2(qugrid%nx+1,qugrid%ny+1))
+		sor%p3 = 0.
+		!$OMP parallel do private(i, j)
+		do j = 1, qugrid%ny+1
+			do i = 1, qugrid%nx+1
+				sor%Hh2(i,j) = (qugrid%Lz / (qugrid%Lz - topo%h(i,j)))**2
+			enddo
+		enddo
+		!$OMP end parallel do 
+	endif
+	sor%p1 = 0.  ! initialized here because it might not be initialized in the sor depending on SOR_OPTION
+	sor%p2 = 0.	
+
+	end
+	!======================================================================================
+	!======================================================================================
+	SUBROUTINE DetermineThresholdIncreaseSorError(abse, prev_threshold)
+
+	implicit none
+
+	real, intent(IN) :: abse
+	real, intent(OUT) :: prev_threshold
+
+	prev_threshold = 10. * abse
+
+	end
+	!======================================================================================
+	!======================================================================================
+	SUBROUTINE SmoothAlpha2()
+	
+	use grid_module
+	use sor_module
+	
+	implicit none
+	
+	integer ::						&
+		i, j, k							  ! N/A, counter
+		
+	real, dimension(qugrid%nx-1, qugrid%ny-1) :: temp  ! save topo
+		
+	temp = 0.
+	do k = 1, qugrid%nz
+		! Stack blur filter https://en.wikipedia.org/wiki/Box_blur
+		temp = sor%alpha2_fire(:, :, k)
+		do j = 2, qugrid%ny-2
+			do i = 2, qugrid%nx-2
+				temp(i, j) = (										&
+					sor%alpha2_fire(i+1, j-1, k)	+			&
+					sor%alpha2_fire(i+1, j, k)		+			&
+					sor%alpha2_fire(i+1, j+1, k)	+			&
+					sor%alpha2_fire(i, j-1, k)		+			&
+					sor%alpha2_fire(i, j, k)		+			&
+					sor%alpha2_fire(i, j+1, k)		+			&
+					sor%alpha2_fire(i-1, j-1, k)	+			&
+					sor%alpha2_fire(i-1, j, k)		+			&
+					sor%alpha2_fire(i-1, j+1, k)	) / 9.
+			enddo
+		enddo
+		
+		do j = 2, qugrid%ny-2
+			do i = 2, qugrid%nx-2
+				sor%alpha2_fire(i, j, k) = temp(i, j)
+			enddo
+		enddo
+	enddo
+	
+	END
+	!============================================================================
+	!======================================================================================
+	SUBROUTINE SwapIndices(is,ie,js,je,step)
+
+	implicit none
+	!Function swaps beginning and ending indices with step to help reduce asymmetry in the wind field
+
+	integer, intent(INOUT) :: is,ie,js,je,step
+	integer :: phx,phy
+
+	phx=is
+	phy=js
+	is=ie
+	js=je
+	ie=phx
+	je=phy
+	step=-1*step
+		
+	end
+
+        subroutine copyA(B,A,nx,ny,s,e)
+        integer nx,ny,nz,i,j,k,s,e,klocal
+        real B(nx,ny,e-s+1)
+        real A(nx,ny,nz)
+
+        klocal=1
+        do k=s,e
+                do j=1,ny
+                        do i=1,nx
+                                B(i,j,klocal)=A(i,j,k)
+                        end do
+                end do
+                klocal=klocal+1
+        end do
+        return
+        end
+	
+
+		
